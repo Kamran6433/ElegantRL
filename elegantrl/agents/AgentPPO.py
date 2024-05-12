@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from typing import Tuple
 from torch import Tensor
 
@@ -37,6 +38,10 @@ class AgentPPO(AgentBase):
         self.value_avg = torch.zeros(1, dtype=torch.float32, device=self.device)
         self.value_std = torch.ones(1, dtype=torch.float32, device=self.device)
 
+    """
+    EXPLORATION - The explore_one_env and explore_vec_env methods are responsible for collecting trajectories 
+    (sequences of states, actions, rewards, and done flags) through interaction with the environment
+    """
     def explore_one_env(self, env, horizon_len: int, if_random: bool = False) -> Tuple[Tensor, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **single** environment instance.
@@ -57,20 +62,40 @@ class AgentPPO(AgentBase):
         rewards = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
         dones = torch.zeros((horizon_len, self.num_envs), dtype=torch.bool).to(self.device)
 
+        # if self.last_state is None:
+        #     # Reset environment and set the initial state
+        #     initial_state = env.reset()
+        #     print("initial_state: ", initial_state)
+        #     self.last_state = torch.as_tensor(initial_state, dtype=torch.float32, device=self.device).unsqueeze(0)
         state = self.last_state  # shape == (1, state_dim) for a single env.
 
         get_action = self.act.get_action
         convert = self.act.convert_action_for_env
         for t in range(horizon_len):
-            action, logprob = get_action(state)
+            print(f"State type before conversion: {type(state)}")
+            print(f"State value before conversion: {state}")
+            # state = safe_tensor_conversion(state, (1, 333), self.device)
+            state = safe_tensor_conversion(state, (1, self.state_dim), self.device)
+            print(f"State shape after conversion: {state.shape}")
+
+            action, logprob = (t.squeeze(0) for t in get_action(state.unsqueeze(0))[:2])
+            # action, logprob = get_action(state)
             states[t] = state
 
             ary_action = convert(action[0]).detach().cpu().numpy()
-            ary_state, reward, done, _ = env.step(ary_action)  # next_state
+            ary_state, reward, done, extra_boolean, *_ = env.step(ary_action)  # next_state
             ary_state = env.reset() if done else ary_state  # ary_state.shape == (state_dim, )
-            state = torch.as_tensor(ary_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            # state = torch.as_tensor(ary_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+            print(f"ary_state type: {type(ary_state)}")
+            print(f"ary_state value: {ary_state}")
+            # state = safe_tensor_conversion(state, (1, 333), self.device)
+            state = safe_tensor_conversion(ary_state, (1, self.state_dim), self.device)
+            print(f"State shape after conversion: {state.shape}")
+
             actions[t] = action
-            logprobs[t] = logprob
+            # logprobs[t] = logprob
+            logprobs[t] = logprob.mean()  # or logprob.sum()
             rewards[t] = reward
             dones[t] = done
 
@@ -99,6 +124,10 @@ class AgentPPO(AgentBase):
         rewards = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
         dones = torch.zeros((horizon_len, self.num_envs), dtype=torch.bool).to(self.device)
 
+        # if self.last_state is None:
+        #     # Reset environment and set the initial state
+        #     initial_state = env.reset()
+        #     self.last_state = torch.as_tensor(initial_state, dtype=torch.float32, device=self.device).unsqueeze(0)
         state = self.last_state  # shape == (env_num, state_dim) for a vectorized env.
 
         get_action = self.act.get_action
@@ -119,6 +148,16 @@ class AgentPPO(AgentBase):
         undones = 1.0 - dones.type(torch.float32)
         return states, actions, logprobs, rewards, undones
 
+    """
+    The update_net method is responsible for updating the policy and value networks using the collected
+    trajectories and estimated advantages
+    
+    It performs multiple updates (based on the update_times and batch_size) using mini-batches
+    sampled from the collected data
+    
+    The policy network is updated using the PPO objective, whcih indicates the surrogate loss
+    and an entropy bonus to encourage exploration
+    """
     def update_net(self, buffer) -> Tuple[float, ...]:
         with torch.no_grad():
             states, actions, logprobs, rewards, undones = buffer
@@ -180,6 +219,12 @@ class AgentPPO(AgentBase):
         a_std_log = self.act.action_std_log.mean() if hasattr(self.act, 'action_std_log') else torch.zeros(1)
         return obj_critics / update_times, obj_actors / update_times, a_std_log.item()
 
+    """
+    The get_advantages_origin and get_advantages_vtrace methods estimate the advantage function
+    using the collected trajectories (state, action, reward)
+    
+    The advantage function measures how much better an action is compared to the average action in that state
+    """
     def get_advantages_origin(self, rewards: Tensor, undones: Tensor, values: Tensor) -> Tensor:
         advantages = torch.empty_like(values)  # advantage value
 
@@ -295,3 +340,23 @@ class AgentDiscretePPO(AgentPPO):
         rewards *= self.reward_scale
         undones = 1.0 - dones.type(torch.float32)
         return states, actions, logprobs, rewards, undones
+
+def safe_tensor_conversion(ary_state, expected_shape, device):
+    # Handle different data types and structures of ary_state
+    if isinstance(ary_state, tuple):
+        # Assuming the first element of the tuple is the array and the second element is a dict
+        ary_state, _ = ary_state  # Ignore the dict part and only take the array part
+        if isinstance(ary_state, np.ndarray) and ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    elif isinstance(ary_state, np.ndarray):
+        if ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+    else:
+        # print(f"Warning: ary_state type {type(ary_state)} unrecognised. Setting to default.")
+        ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    # Proceed with the conversion now that ary_state is guaranteed to be correct
+    return torch.as_tensor(ary_state, dtype=torch.float32, device=device)

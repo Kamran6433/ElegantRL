@@ -1,10 +1,16 @@
 import math
 import torch
+import numpy as np
 import torch.nn as nn
 from torch import Tensor
 from torch.distributions.normal import Normal
+import torch.nn.functional as F
 
-"""DQN"""
+"""
+This net.py file contains the implementation of various Neural Network architectures used 
+in the reinforcement learning algorithm, including the actor (policy) network and critic
+(value) network. The ActorPPO represents the policy network used in PPO algorithm.
+"""
 
 
 class QNetBase(nn.Module):  # nn.Module is a standard PyTorch Network
@@ -21,6 +27,12 @@ class QNetBase(nn.Module):  # nn.Module is a standard PyTorch Network
         self.value_std = nn.Parameter(torch.ones((1,)), requires_grad=False)
 
     def state_norm(self, state: Tensor) -> Tensor:
+        # Assuming initial_state is your initial state array
+        # and it's already converted to a torch tensor of shape [1, N]
+        if not hasattr(self, 'state_avg') or not hasattr(self, 'state_std'):
+            self.state_avg = torch.zeros_like(self.last_state, dtype=torch.float32, device=self.device)
+            self.state_std = torch.ones_like(self.last_state, dtype=torch.float32, device=self.device)
+
         return (state - self.state_avg) / self.state_std
 
     def value_re_norm(self, value: Tensor) -> Tensor:
@@ -179,10 +191,38 @@ class ActorBase(nn.Module):
         self.explore_noise_std = None  # standard deviation of exploration action noise
         self.ActionDist = torch.distributions.normal.Normal
 
+        print(f"State_dim: {state_dim}")
+        print(f"Action_dim: {action_dim}")
+
         self.state_avg = nn.Parameter(torch.zeros((state_dim,)), requires_grad=False)
         self.state_std = nn.Parameter(torch.ones((state_dim,)), requires_grad=False)
 
+        # self.state_avg = None
+        # self.state_std = None
+
     def state_norm(self, state: Tensor) -> Tensor:
+        # Assuming initial_state is your initial state array
+        # and it's already converted to a torch tensor of shape [1, N]
+
+        expected_shape = get_expected_state_shape(state, 333)
+        state = safe_tensor_conversion(state, expected_shape, state.device)
+
+        # if not hasattr(self, 'state_avg') or not hasattr(self, 'state_std'):
+        #     self.state_avg = torch.zeros_like(self.last_state, dtype=torch.float32, device=self.device)
+        #     self.state_std = torch.ones_like(self.last_state, dtype=torch.float32, device=self.device)
+
+        # Dynamically adjust state_avg and state_std based on incoming state size
+        # if self.state_avg is None or self.state_std is None or self.state_avg.shape[0] != state.shape[-1]:
+        #     device = state.device
+        #     self.state_avg = torch.zeros((state.shape[-1],), dtype=torch.float32, device=device)
+        #     self.state_std = torch.ones((state.shape[-1],), dtype=torch.float32, device=device)
+
+        # Dynamically adjust state_avg and state_std based on incoming state size
+        if not hasattr(self, 'state_avg') or self.state_avg.shape[-1] != state.shape[-1]:
+            device = state.device
+            self.state_avg = torch.nn.Parameter(torch.zeros(state.shape[-1], device=device), requires_grad=False)
+            self.state_std = torch.nn.Parameter(torch.ones(state.shape[-1], device=device), requires_grad=False)
+
         return (state - self.state_avg) / self.state_std
 
 
@@ -269,8 +309,16 @@ class ActorFixSAC(ActorSAC):
 
 
 class ActorPPO(ActorBase):
+    """
+    The ActorPPO class is responsible for generating actions based on the current state and
+    learning the optimal policy through the PPO algorithm.
+    The POLICY is represented by the neural network parameters, which are updated
+    during the training process using the PPO objective
+    """
     def __init__(self, dims: [int], state_dim: int, action_dim: int):
         super().__init__(state_dim=state_dim, action_dim=action_dim)
+        # print(f"State_dim: {state_dim}")
+        # print(f"Action_dim: {action_dim}")
         self.net = build_mlp(dims=[state_dim, *dims, action_dim])
         layer_init_with_orthogonal(self.net[-1], std=0.1)
 
@@ -278,10 +326,19 @@ class ActorPPO(ActorBase):
 
     def forward(self, state: Tensor) -> Tensor:
         state = self.state_norm(state)
+        # print(f"STATE before the error: {state}")
+        # print("STATE size before error:", state.size())
         return self.net(state).tanh()  # action.tanh()
 
     def get_action(self, state: Tensor) -> (Tensor, Tensor):  # for exploration
+        """
+        get_action method is used for exploration and selecting actions based on the current state.
+
+        It performs a forward pass through the network to obtain the average action.
+        """
         state = self.state_norm(state)
+        # print(f"STATE before the error: {state}")
+        # print("State size before error:", state.size())
         action_avg = self.net(state)
         action_std = self.action_std_log.exp()
 
@@ -291,6 +348,12 @@ class ActorPPO(ActorBase):
         return action, logprob
 
     def get_logprob_entropy(self, state: Tensor, action: Tensor) -> (Tensor, Tensor):
+        """
+        get_logprob_entropy method calculates the log probability and entropy of a given action for a given state.
+
+        It performs similar steps as the get_action method to obtain the action distribution
+
+        """
         state = self.state_norm(state)
         action_avg = self.net(state)
         action_std = self.action_std_log.exp()
@@ -356,6 +419,13 @@ class CriticBase(nn.Module):  # todo state_norm, value_norm
         self.value_std = nn.Parameter(torch.ones((1,)), requires_grad=False)
 
     def state_norm(self, state: Tensor) -> Tensor:
+        # Assuming initial_state is your initial state array
+        # and it's already converted to a torch tensor of shape [1, N]
+
+        if not hasattr(self, 'state_avg') or not hasattr(self, 'state_std'):
+            self.state_avg = torch.zeros_like(self.last_state, dtype=torch.float32, device=self.device)
+            self.state_std = torch.ones_like(self.last_state, dtype=torch.float32, device=self.device)
+
         return (state - self.state_avg) / self.state_std  # todo state_norm
 
     def value_re_norm(self, value: Tensor) -> Tensor:
@@ -522,3 +592,54 @@ class ConvNet(nn.Module):  # pixel-level state encoder
         print(image.shape)
         output = net(image)
         print(output.shape)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out)
+        return F.softmax(out)
+
+
+
+def get_expected_state_shape(state, model_input_dim, env=None):
+    # print(env)
+    if isinstance(state, tuple):
+        state_array = state[0]
+    else:
+        state_array = state
+
+    if isinstance(state_array, np.ndarray):
+        if state_array.ndim == 1:
+            expected_shape = (1, state_array.shape[0])
+        else:
+            expected_shape = (1, state_array.shape[1])
+    else:
+        expected_shape = (1, model_input_dim)
+
+    # print(f"Expected Shape at the end: {expected_shape}")
+    return expected_shape
+
+def safe_tensor_conversion(ary_state, expected_shape, device):
+    # Handle different data types and structures of ary_state
+    if isinstance(ary_state, tuple):
+        # Assuming the first element of the tuple is the array and the second element is a dict
+        ary_state, _ = ary_state  # Ignore the dict part and only take the array part
+        if isinstance(ary_state, np.ndarray) and ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    elif isinstance(ary_state, np.ndarray):
+        if ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+    else:
+        # print(f"Warning: ary_state type {type(ary_state)} unrecognised. Setting to default.")
+        ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    # Proceed with the conversion now that ary_state is guaranteed to be correct
+    return torch.as_tensor(ary_state, dtype=torch.float32, device=device)

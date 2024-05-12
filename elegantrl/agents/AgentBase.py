@@ -1,3 +1,4 @@
+import numpy as np
 import os
 import torch
 from typing import Tuple, Union
@@ -20,15 +21,18 @@ class AgentBase:
 
     def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
         self.gamma = args.gamma  # discount factor of future rewards
-        self.num_envs = args.num_envs  # the number of sub envs in vectorized env. `num_envs=1` in single env.
+        # self.num_envs = args.num_envs  # the number of sub envs in vectorized env. `num_envs=1` in single env.
+        self.num_envs = args.num_envs if args and hasattr(args, 'num_envs') else 1
         self.batch_size = args.batch_size  # num of transitions sampled from replay buffer.
         self.repeat_times = args.repeat_times  # repeatedly update network using ReplayBuffer
         self.reward_scale = args.reward_scale  # an approximate target reward usually be closed to 256
         self.learning_rate = args.learning_rate  # the learning rate for network updating
         self.if_off_policy = args.if_off_policy  # whether off-policy or on-policy of DRL algorithm
-        self.clip_grad_norm = args.clip_grad_norm  # clip the gradient after normalization
+        # self.clip_grad_norm = args.clip_grad_norm  # clip the gradient after normalization
+        self.clip_grad_norm = getattr(args, 'clip_grad_norm', None) or 0.5
         self.soft_update_tau = args.soft_update_tau  # the tau of soft target update `net = (1-tau)*net + net1`
-        self.state_value_tau = args.state_value_tau  # the tau of normalize for value and state
+        # self.state_value_tau = args.state_value_tau  # the tau of normalize for value and state
+        self.state_value_tau = getattr(args, 'state_value_tau', 0.001)
 
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -41,6 +45,9 @@ class AgentBase:
         self.act = self.act_target = act_class(net_dims, state_dim, action_dim).to(self.device)
         self.cri = self.cri_target = cri_class(net_dims, state_dim, action_dim).to(self.device) \
             if cri_class else self.act
+        # self.act = self.act_target = None
+        # self.cri = self.cri_target = None
+        # self.initialize_networks(net_dims, state_dim, action_dim)
 
         '''optimizer'''
         self.act_optimizer = torch.optim.AdamW(self.act.parameters(), self.learning_rate)
@@ -67,6 +74,30 @@ class AgentBase:
         """save and load"""
         self.save_attr_names = {'act', 'act_target', 'act_optimizer', 'cri', 'cri_target', 'cri_optimizer'}
 
+    # def initialize_networks(self, net_dims: [int], state_dim: int, action_dim: int):
+    #     """Dynamically initializes the actor and critic networks based on state_dim"""
+    #     act_class = getattr(self, "act_class", None)
+    #     cri_class = getattr(self, "cri_class", None)
+    #
+    #     self.act = self.act_target = act_class(net_dims, state_dim, action_dim).to(self.device)
+    #     self.cri = self.cri_target = cri_class(net_dims, state_dim, action_dim).to(self.device) \
+    #         if cri_class else self.act
+    #
+    #     # Reinitialize optimizers because network parameters have changed
+    #     self.act_optimizer = torch.optim.AdamW(self.act.parameters(), self.learning_rate)
+    #     self.cri_optimizer = torch.optim.AdamW(self.cri.parameters(), self.learning_rate) \
+    #         if cri_class else self.act_optimizer
+    #
+    # def adjust_networks_based_on_state(self, ary_state):
+    #     if ary_state is not None:
+    #         current_state_dim = ary_state.shape[-1]
+    #         if current_state_dim != self.state_dim:
+    #             self.state_dim = current_state_dim
+    #             self.initialize_networks(self.net_dims, self.state_dim, self.action_dim)  # Assuming this method exists
+    #     else:
+    #         # Handle the case where ary_state is None, which shouldn't normally happen
+    #         print("Warning: Received None state from environment. Check environment reset logic.")
+
     def explore_one_env(self, env, horizon_len: int, if_random: bool = False) -> Tuple[Tensor, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **single** environment instance.
@@ -86,6 +117,12 @@ class AgentBase:
         rewards = torch.zeros((horizon_len, self.num_envs), dtype=torch.float32).to(self.device)
         dones = torch.zeros((horizon_len, self.num_envs), dtype=torch.bool).to(self.device)
 
+        if self.last_state is None:
+            # Reset environment and set the initial state
+            initial_state, info = env.reset()
+            self.last_state = torch.as_tensor(initial_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            self.adjust_networks_based_on_state(initial_state)
+
         state = self.last_state  # state.shape == (1, state_dim) for a single env.
 
         get_action = self.act.get_action
@@ -94,12 +131,28 @@ class AgentBase:
             states[t] = state
 
             ary_action = action[0].detach().cpu().numpy()
-            ary_state, reward, done, _ = env.step(ary_action)  # next_state
-            ary_state = env.reset() if done else ary_state  # ary_state.shape == (state_dim, )
-            state = torch.as_tensor(ary_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            ary_state, reward, done, info, _ = env.step(ary_action)  # next_state
+            if done:
+                ary_state, _ = env.reset()  # Ensure a valid state is received
+            # ary_state = env.reset() if done else ary_state  # ary_state.shape == (state_dim, )
+
+            self.adjust_networks_based_on_state(ary_state)
+
+            model_input_dim = get_model_input_dim_from_state(ary_state)
+            state_dim = ary_state.shape[-1] if ary_state is not None else self.state_dim
+
+            # Use model_input_dim to determine expected shape
+            # expected_shape = (1, model_input_dim)
+            expected_shape = (1, state_dim)
+
+            state = safe_tensor_conversion(ary_state, expected_shape, device=self.device)
+            # state = torch.as_tensor(ary_state, dtype=torch.float32, device=self.device).unsqueeze(0)
             actions[t] = action
             rewards[t] = reward
             dones[t] = done
+
+            if done:
+                break
 
         self.last_state = state  # state.shape == (1, state_dim) for a single env.
 
@@ -271,3 +324,51 @@ def get_optim_param(optimizer: torch.optim) -> list:  # backup
     for params_dict in optimizer.state_dict()["state"].values():
         params_list.extend([t for t in params_dict.values() if isinstance(t, torch.Tensor)])
     return params_list
+
+# Assuming ary_state is already defined and reflects the full state
+def get_model_input_dim_from_state(ary_state):
+    if isinstance(ary_state, tuple):
+        ary_state = ary_state[0]  # Assuming the first element is the relevant state
+    if isinstance(ary_state, np.ndarray):
+        model_input_dim = ary_state.shape[0] if ary_state.ndim == 1 else ary_state.shape[1]
+    else:
+        raise ValueError("ary_state format unrecognized.")
+    return model_input_dim
+
+def get_expected_state_shape(env, state, model_input_dim):
+    print(env)
+    if isinstance(state, tuple):
+        state_array = state[0]
+    else:
+        state_array = state
+
+    if isinstance(state_array, np.ndarray):
+        if state_array.ndim == 1:
+            expected_shape = (1, state_array.shape[0])
+        else:
+            expected_shape = (1, state_array.shape[1])
+    else:
+        expected_shape = (1, model_input_dim)
+
+    print(f"Expected Shape at the end: {expected_shape}")
+    return expected_shape
+
+def safe_tensor_conversion(ary_state, expected_shape, device):
+    # Handle different data types and structures of ary_state
+    if isinstance(ary_state, tuple):
+        # Assuming the first element of the tuple is the array and the second element is a dict
+        ary_state, _ = ary_state  # Ignore the dict part and only take the array part
+        if isinstance(ary_state, np.ndarray) and ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    elif isinstance(ary_state, np.ndarray):
+        if ary_state.shape != expected_shape:
+            # print(f"Warning: ary_state ndarray shape mismatch. Expected {expected_shape}, got {ary_state.shape}. Setting to default.")
+            ary_state = np.zeros(expected_shape, dtype=np.float32)
+    else:
+        # print(f"Warning: ary_state type {type(ary_state)} unrecognised. Setting to default.")
+        ary_state = np.zeros(expected_shape, dtype=np.float32)
+
+    # Proceed with the conversion now that ary_state is guaranteed to be correct
+    return torch.as_tensor(ary_state, dtype=torch.float32, device=device)

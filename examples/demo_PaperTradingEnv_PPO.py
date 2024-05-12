@@ -71,7 +71,7 @@ def run():
           API_SECRET=API_SECRET,
           API_BASE_URL=API_BASE_URL,
           erl_params=erl_params,
-          cwd='./papertrading_erl',  # current_working_dir
+          cwd='./papertrading_erl_testing',  # current_working_dir
           break_step=1e5)
 
 
